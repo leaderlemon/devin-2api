@@ -35,6 +35,8 @@ type eventWire struct {
 type protocolOptions struct {
 	Stream       bool
 	IncludeUsage bool
+	// PreviousResponseID 只有 Responses 协议会填，供服务端补齐历史。
+	PreviousResponseID string
 }
 
 // responsesProtocol 实现 OpenAI Responses API 协议。
@@ -139,6 +141,9 @@ func decodeResponsesRequest(data []byte) (llm.RequestMessages, protocolOptions, 
 	return adapted.Context, protocolOptions{
 		Stream:       adapted.Options.Stream,
 		IncludeUsage: false,
+		// 这是 previous_response_id 从解码层走进 handler 的唯一通路；
+		// 丢掉它就会退回"每轮盲答"。
+		PreviousResponseID: adapted.Options.PreviousResponseID,
 	}, nil
 }
 

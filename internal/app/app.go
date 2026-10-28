@@ -21,6 +21,8 @@ import (
 	"github.com/leookun/devin-2api/internal/config"
 	"github.com/leookun/devin-2api/internal/debuglog"
 	"github.com/leookun/devin-2api/internal/llm"
+	"github.com/leookun/devin-2api/internal/responsestore"
+	respproto "github.com/leookun/devin-2api/internal/api/openai/responses"
 )
 
 // DashboardRegistrar 描述面板路由注册所需的最小能力。
@@ -58,6 +60,8 @@ type App struct {
 	apiKey string
 	// concurrency 限制同时处理的 /v1/* 请求数。
 	concurrency chan struct{}
+	// responses 保存 Responses API 的服务端会话，供 previous_response_id 补齐历史。
+	responses *responsestore.Store
 }
 
 // New 创建一个使用指定供应商适配器的 HTTP 应用。
@@ -71,6 +75,7 @@ func New(providerAdapter adapter.Adapter, serverConfig config.ServerConfig, debu
 		serverConfig: serverConfig,
 		debugManager: debugManager,
 		concurrency:  make(chan struct{}, limit),
+		responses:    responsestore.New(0, 0),
 	}
 }
 
@@ -299,6 +304,37 @@ func (application *App) createCompletion(
 	}
 	completion.Model = messages.Model
 	completion.Stream = options.Stream
+	// previous_response_id 只有 Responses 协议会填；其余协议该字段恒为空，
+	// WithHistory 原样返回，行为与改造前一致。
+	//
+	// 解析不到 / 客户端已带完整历史都不打断请求（兼容性优先，见 WithHistory 注释），
+	// 但要把结果写成可观测事实，而不是退回"每轮盲答且无人知道"。
+	if options.PreviousResponseID != "" {
+		caller := application.apiKey
+		if caller == "" {
+			caller = "default"
+		}
+		merged, resolution, historyErr := respproto.WithHistory(messages, options.PreviousResponseID, caller, application.responses.Get)
+		if historyErr != nil {
+			completion.StatusCode = http.StatusBadRequest
+			writeLoggedError(writer, recorder, "previous_response_id", completion.StatusCode, historyErr)
+			return
+		}
+		messages = merged
+		switch {
+		case resolution.Injected:
+			recorder.WriteJSON("02b-history-injected.json", map[string]any{
+				"previous_response_id": options.PreviousResponseID,
+				"history_messages":     resolution.HistoryCount,
+			})
+		case resolution.ClientSuppliedFullHistory:
+		case resolution.UnknownID:
+			recorder.WriteJSON("02b-history-unresolved.json", map[string]any{
+				"previous_response_id": options.PreviousResponseID,
+				"reason":               "unknown, expired, or owned by another caller",
+			})
+		}
+	}
 	recorder.WriteJSON("02-request-messages.json", debuglog.RequestMessagesProjection(messages))
 	ctx := debuglog.WithRecorder(request.Context(), recorder)
 	stream, err := application.adapter.Stream(ctx, messages)
@@ -335,6 +371,8 @@ func (application *App) createCompletion(
 			return
 		}
 		completion.Result = "completed"
+		// 流式路径不在此存：客户端拿到的 id 由 StreamEncoder 生成，
+		// 与 message.ResponseID 不保证一致；存了会得到一个客户端永远取不到的键。
 		return
 	}
 	message, err := collectFinalMessage(ctx, stream, recorder)
@@ -359,6 +397,55 @@ func (application *App) createCompletion(
 	recorder.AppendJSONL("06-http-response.jsonl", "response", json.RawMessage(body))
 	completion.StatusCode = http.StatusOK
 	completion.Result = "completed"
+	application.rememberResponsesExchange(messages, message, body)
+}
+
+// rememberResponse 把「本轮输入 + 助手输出」存成一条会话快照，供下一次
+// 带 previous_response_id 的调用补齐历史。只对携带 id 的请求生效——
+// 没有 id 就没有后续链式引用，存了只是白占内存。
+func (application *App) rememberResponse(requestMessages llm.RequestMessages, reply *llm.AssistantMessage) {
+	if application.responses == nil || reply == nil {
+		return
+	}
+	caller := application.apiKey
+	if caller == "" {
+		caller = "default"
+	}
+	history := make([]llm.Message, 0, len(requestMessages.Messages)+1)
+	history = append(history, requestMessages.Messages...)
+	history = append(history, *reply)
+	application.responses.Put(caller, history)
+}
+
+// rememberResponsesExchange 用「客户端实际收到的那个响应 id」作为键保存会话。
+//
+// 为什么不能直接用 reply.ResponseID：协议层（responses.EncodeResponse）在
+//  ResponseID 不以 "resp_" 开头时会**本地另生成一个**返回给客户端。若这里按
+// reply.ResponseID 存，客户端下一轮回传的是生成值，必然查不到——注入永远不生效，
+// 而且表面上一切正常（这是本轮实际踩到的坑）。
+// 因此从编码后的响应体里读回 id，保证两侧落到同一个键上。
+func (application *App) rememberResponsesExchange(
+	requestMessages llm.RequestMessages,
+	reply *llm.AssistantMessage,
+	encoded []byte,
+) {
+	if application.responses == nil || reply == nil || len(encoded) == 0 {
+		return
+	}
+	var projection struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(encoded, &projection); err != nil || projection.ID == "" {
+		return
+	}
+	caller := application.apiKey
+	if caller == "" {
+		caller = "default"
+	}
+	history := make([]llm.Message, 0, len(requestMessages.Messages)+1)
+	history = append(history, requestMessages.Messages...)
+	history = append(history, *reply)
+	application.responses.PutWithID(caller, projection.ID, history)
 }
 
 func writeProtocolStream(
