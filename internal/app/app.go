@@ -359,7 +359,7 @@ func (application *App) createCompletion(
 		}
 
 		completion.StatusCode = http.StatusOK
-		message, streamErr := writeProtocolStream(ctx, writer, stream, recorder, protocol, messages.Model, options, firstEvent, err)
+		message, encoder, streamErr := writeProtocolStream(ctx, writer, stream, recorder, protocol, messages.Model, options, firstEvent, err)
 		updateCompletionIdentity(&completion, message)
 		if streamErr != nil {
 			if errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
@@ -371,8 +371,7 @@ func (application *App) createCompletion(
 			return
 		}
 		completion.Result = "completed"
-		// 流式路径不在此存：客户端拿到的 id 由 StreamEncoder 生成，
-		// 与 message.ResponseID 不保证一致；存了会得到一个客户端永远取不到的键。
+		application.rememberStreamExchange(messages, message, encoder)
 		return
 	}
 	message, err := collectFinalMessage(ctx, stream, recorder)
@@ -400,29 +399,11 @@ func (application *App) createCompletion(
 	application.rememberResponsesExchange(messages, message, body)
 }
 
-// rememberResponse 把「本轮输入 + 助手输出」存成一条会话快照，供下一次
-// 带 previous_response_id 的调用补齐历史。只对携带 id 的请求生效——
-// 没有 id 就没有后续链式引用，存了只是白占内存。
-func (application *App) rememberResponse(requestMessages llm.RequestMessages, reply *llm.AssistantMessage) {
-	if application.responses == nil || reply == nil {
-		return
-	}
-	caller := application.apiKey
-	if caller == "" {
-		caller = "default"
-	}
-	history := make([]llm.Message, 0, len(requestMessages.Messages)+1)
-	history = append(history, requestMessages.Messages...)
-	history = append(history, *reply)
-	application.responses.Put(caller, history)
-}
-
 // rememberResponsesExchange 用「客户端实际收到的那个响应 id」作为键保存会话。
 //
 // 为什么不能直接用 reply.ResponseID：协议层（responses.EncodeResponse）在
-//  ResponseID 不以 "resp_" 开头时会**本地另生成一个**返回给客户端。若这里按
-// reply.ResponseID 存，客户端下一轮回传的是生成值，必然查不到——注入永远不生效，
-// 而且表面上一切正常（这是本轮实际踩到的坑）。
+// ResponseID 不以 "resp_" 开头时会本地另生成一个返回给客户端。若这里按
+// reply.ResponseID 存，客户端下一轮回传的是生成值，必然查不到。
 // 因此从编码后的响应体里读回 id，保证两侧落到同一个键上。
 func (application *App) rememberResponsesExchange(
 	requestMessages llm.RequestMessages,
@@ -458,10 +439,10 @@ func writeProtocolStream(
 	options protocolOptions,
 	firstEvent llm.ResponseEvent,
 	firstErr error,
-) (*llm.AssistantMessage, error) {
+) (*llm.AssistantMessage, streamEncoder, error) {
 	flusher, ok := writer.(http.Flusher)
 	if !ok {
-		return nil, errors.New("streaming response writer does not support flushing")
+		return nil, nil, errors.New("streaming response writer does not support flushing")
 	}
 	writer.Header().Set("Content-Type", "text/event-stream")
 	writer.Header().Set("Cache-Control", "no-cache")
@@ -471,19 +452,19 @@ func writeProtocolStream(
 	event, err := firstEvent, firstErr
 	for {
 		if errors.Is(err, io.EOF) {
-			return latest, nil
+			return latest, encoder, nil
 		}
 		if err != nil {
-			return latest, err
+			return latest, encoder, err
 		}
 		latest = eventMessage(event, latest)
 		encodedEvents, encodeErr := encoder.Encode(event)
 		if encodeErr != nil {
-			return latest, encodeErr
+			return latest, encoder, encodeErr
 		}
 		for _, encoded := range encodedEvents {
 			if _, wErr := writer.Write(protocol.SSEFormat(encoded.Name, encoded.Data)); wErr != nil {
-				return latest, wErr
+				return latest, encoder, wErr
 			}
 			if encoded.Name == "[DONE]" {
 				recorder.AppendJSONL("06-http-response.jsonl", encoded.Name, string(encoded.Data))
@@ -495,9 +476,9 @@ func writeProtocolStream(
 		if event.Type == llm.ResponseEventError {
 			// 错误 SSE 已在上面循环写出，这里直接返回错误供外层记录失败日志。
 			if event.Error != nil && event.Error.ErrorMessage != "" {
-				return latest, errors.New(event.Error.ErrorMessage)
+				return latest, encoder, errors.New(event.Error.ErrorMessage)
 			}
-			return latest, errors.New("response stream returned an error event")
+			return latest, encoder, errors.New("response stream returned an error event")
 		}
 		event, err = receiveEvent(ctx, stream, recorder)
 	}
@@ -638,4 +619,40 @@ func mapProviderErrorStatus(err error) int {
 	default:
 		return http.StatusBadGateway
 	}
+}
+
+// streamIDProvider 由能自报响应 id 的流式编码器实现（目前只有 Responses）。
+type streamIDProvider interface {
+	ResponseID() string
+}
+
+// rememberStreamExchange 保存一次流式 Responses 会话。
+//
+// 流式响应公布的 id 由 StreamEncoder 在构造时生成，与 message.ResponseID 无关，
+// 事后无法从上游字段反推；因此必须从编码器取回**客户端真正看到的那个 id**，
+// 否则存下的键永远无法被下一轮 previous_response_id 命中。
+func (application *App) rememberStreamExchange(
+	requestMessages llm.RequestMessages,
+	reply *llm.AssistantMessage,
+	encoder streamEncoder,
+) {
+	if application.responses == nil || reply == nil || encoder == nil {
+		return
+	}
+	provider, ok := encoder.(streamIDProvider)
+	if !ok {
+		return
+	}
+	responseID := provider.ResponseID()
+	if responseID == "" {
+		return
+	}
+	caller := application.apiKey
+	if caller == "" {
+		caller = "default"
+	}
+	history := make([]llm.Message, 0, len(requestMessages.Messages)+1)
+	history = append(history, requestMessages.Messages...)
+	history = append(history, *reply)
+	application.responses.PutWithID(caller, responseID, history)
 }

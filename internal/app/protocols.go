@@ -90,6 +90,15 @@ func (p anthropicProtocol) SSEFormat(name string, data []byte) []byte {
 
 type responsesStreamAdapter struct{ encoder *responses.StreamEncoder }
 
+// ResponseID 暴露流式响应对客户端公布的那个 id。
+// 其余协议（chat / anthropic）不实现它，handler 通过类型断言按需取用。
+func (a *responsesStreamAdapter) ResponseID() string {
+	if a == nil || a.encoder == nil {
+		return ""
+	}
+	return a.encoder.ResponseID()
+}
+
 func (a *responsesStreamAdapter) Encode(event llm.ResponseEvent) ([]eventWire, error) {
 	raw, err := a.encoder.Encode(event)
 	if err != nil {
@@ -141,7 +150,7 @@ func decodeResponsesRequest(data []byte) (llm.RequestMessages, protocolOptions, 
 	return adapted.Context, protocolOptions{
 		Stream:       adapted.Options.Stream,
 		IncludeUsage: false,
-		// 这是 previous_response_id 从解码层走进 handler 的唯一通路；
+		// previous_response_id 从解码层走进 handler 的唯一通路；
 		// 丢掉它就会退回"每轮盲答"。
 		PreviousResponseID: adapted.Options.PreviousResponseID,
 	}, nil
